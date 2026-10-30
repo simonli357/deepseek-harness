@@ -29,10 +29,14 @@ import {
   type CancelNotification,
   type CloseSessionRequest,
   type CloseSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -45,13 +49,20 @@ import {
   type SessionNotification,
   type Stream,
 } from '@agentclientprotocol/sdk'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import {
+  buildForkSeed,
+  type SessionEvent,
+  type SessionId,
+  type SessionSeq,
+} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
+import type {} from '@deepseek-ai/dsh-compaction'
+import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import { supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
-import { AcpModelConfigError } from './model-control.ts'
+import { AcpModelConfigError, AcpModelControl } from './model-control.ts'
 import { AcpSession } from './session.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
@@ -136,6 +147,10 @@ export function apply(ctx: Context, config: AcpConfig): void {
     if (record?.ownsSession(session) === true) record.onSessionEvent(session, event)
   })
 
+  ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    ownedRecord(agent)?.onAssistantStream(frame)
+  })
+
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     ownedRecord(agent)?.onInboxClaimed(message, turn)
   })
@@ -159,18 +174,29 @@ export function apply(ctx: Context, config: AcpConfig): void {
     const record = ownedRecord(request.agent)
     if (record === undefined || request.callId === undefined) return next()
     const callId = request.callId
+    if (record.hasApprovalGrant(request.toolName)) return Promise.resolve('allowed-once')
     return record.drainUpdates().then(() => {
       const params: RequestPermissionRequest = {
         sessionId: record.agent.session.id,
-        toolCall: { toolCallId: callId },
+        toolCall: {
+          toolCallId: callId,
+          title: request.toolName,
+          kind: editApprovalTool(request.toolName) ? 'edit' : 'other',
+          status: 'pending',
+        },
         options: [
           { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'allow-session', name: 'Allow this tool for the session', kind: 'allow_always' },
           { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
         ],
       }
       return conn.request(methods.client.session.requestPermission, params)
     }).then(({ outcome }) => {
       if (outcome.outcome === 'cancelled') return 'cancelled'
+      if (outcome.optionId === 'allow-session') {
+        record.rememberApprovalGrant(request.toolName)
+        return 'allowed-once'
+      }
       return outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
     })
   })
@@ -180,14 +206,30 @@ export function apply(ctx: Context, config: AcpConfig): void {
       // Single-version agent: the spec's "same version if supported, else
       // the latest supported" both resolve to this server's one version.
       imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
+      const configured = config.provider !== undefined && config.model !== undefined
+        ? {
+            provider: config.provider,
+            model: config.model,
+          } satisfies ModelSelection
+        : ctx.get('agentDefaultModel')?.currentSelection()
+      const configOptions = configured === undefined
+        ? []
+        : await new AcpModelControl(ctx.llm, {
+            current: () => configured,
+            select: () => {},
+            lastStepBoundary: null,
+            lastTurn: 0,
+          }).options()
       return {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
         agentCapabilities: {
+          loadSession: true,
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
-          sessionCapabilities: { close: {}, list: {}, resume: {} },
+          sessionCapabilities: { close: {}, fork: {}, list: {}, resume: {} },
         },
+        _meta: { configOptions },
         authMethods: [],
       }
     },
@@ -238,6 +280,144 @@ export function apply(ctx: Context, config: AcpConfig): void {
       }
     },
 
+    async loadSession(
+      params: LoadSessionRequest,
+      signal: AbortSignal,
+    ): Promise<LoadSessionResponse> {
+      assertOpen()
+      validateWorkspaceParams(params)
+      const sessionId = brandString<SessionId>(params.sessionId)
+      if (sessions.has(sessionId) || activating.has(sessionId) || ctx.sessions.get(sessionId) !== undefined) {
+        throw invalidParams(`session is already active: ${sessionId}`)
+      }
+      activating.add(sessionId)
+      return (async (): Promise<LoadSessionResponse> => {
+        const persisted = (await persistence.stat(sessionId, { signal }))?.header
+        if (persisted === undefined || persisted.origin === 'subagent') {
+          throw invalidParams(`session is not loadable: ${sessionId}`)
+        }
+        const relocate = params._meta?.dshRelocate === true
+        if (!await sameDirectory(persisted.cwd, params.cwd) && !relocate) {
+          throw invalidParams(`session cwd does not match: ${params.cwd}`)
+        }
+        let record: AcpSession
+        try {
+          record = await AcpSession.resume(ctx, {
+            sessionId,
+            cwd: params.cwd,
+            ...(relocate ? { relocate: true } : {}),
+            mcpServers: params.mcpServers ?? [],
+            agentOptions: agentOptions(config),
+            signal,
+            notify,
+          })
+        } catch (error: unknown) {
+          if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
+          throw error
+        }
+        /* v8 ignore next 4 -- a real stdio close can race an in-flight load. */
+        if (closed) {
+          await record.close('connection closed during session/load')
+          throw internalError('connection closed during session/load')
+        }
+        sessions.set(sessionId, record)
+        try {
+          await record.replay()
+          return { configOptions: await record.configOptions(signal) }
+        } catch (error: unknown) {
+          sessions.delete(sessionId)
+          await record.close('session/load failed')
+          throw error
+        }
+      })().finally(() => { activating.delete(sessionId) })
+    },
+
+    async forkSession(
+      params: ForkSessionRequest,
+      signal: AbortSignal,
+    ): Promise<ForkSessionResponse> {
+      assertOpen()
+      validateWorkspaceParams(params)
+      const sourceId = brandString<SessionId>(params.sessionId)
+      const childId = brandString<SessionId>(randomUUID())
+      let sourceEvents: readonly SessionEvent[]
+      let sourceCwd: string | undefined
+      let sourceParentSession: string | undefined
+      const active = sessions.get(sourceId)
+      if (active !== undefined) {
+        // The caller only forks a quiescent native session. Refuse to turn a
+        // live request boundary into an ambiguous inherited tail.
+        if (active.agent.status !== 'idle') {
+          throw invalidParams(`session is not idle: ${sourceId}`)
+        }
+        sourceEvents = active.agent.session.snapshotEvents()
+        sourceCwd = active.agent.session.header.cwd
+        sourceParentSession = active.agent.session.header.parentSession
+      } else {
+        const handle = await persistence.open(sourceId, 'read', { signal })
+        try {
+          const read = await handle.read(0, undefined, { signal })
+          sourceEvents = read.events
+          sourceCwd = handle.header.cwd
+          sourceParentSession = handle.header.parentSession
+          if (handle.header.origin === 'subagent') {
+            throw invalidParams(`session is not forkable: ${sourceId}`)
+          }
+        } finally {
+          await handle.close()
+        }
+      }
+      const relocate = params._meta?.dshRelocate === true
+      if (sourceCwd === undefined || (!relocate && !await sameDirectory(sourceCwd, params.cwd))) {
+        throw invalidParams(`session cwd does not match: ${params.cwd}`)
+      }
+      const boundary: SessionSeq | undefined = sourceEvents.at(-1)?.seq
+      const seed = boundary === undefined ? [] : buildForkSeed(sourceEvents, boundary)
+      const suppliedAncestry = Array.isArray(params._meta?.dshAncestry)
+        ? params._meta.dshAncestry.filter((entry): entry is string => typeof entry === 'string')
+        : []
+      const ancestry = [
+        ...new Set([
+          sourceId,
+          ...suppliedAncestry,
+          ...(suppliedAncestry.length === 0 && sourceParentSession !== undefined
+            ? [sourceParentSession]
+            : []),
+        ]),
+      ]
+      let record: AcpSession
+      try {
+        record = await AcpSession.fork(ctx, {
+          sessionId: childId,
+          seed,
+          inheritedEventCount: boundary === undefined ? 0 : boundary + 1,
+          parentSessionId: sourceId,
+          cwd: params.cwd,
+          ...(relocate ? { relocate: true } : {}),
+          mcpServers: params.mcpServers ?? [],
+          agentOptions: agentOptions(config),
+          signal,
+          notify,
+        })
+      } catch (error: unknown) {
+        if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
+        throw error
+      }
+      sessions.set(childId, record)
+      try {
+        await ctx.sessions.flush(record.agent.session)
+        return {
+          sessionId: childId,
+          configOptions: await record.configOptions(signal),
+          _meta: { dshAncestry: ancestry },
+        }
+      } catch (error: unknown) {
+        sessions.delete(childId)
+        await record.close('session/fork activation failed')
+        throw error
+      }
+    },
+
     async resumeSession(params: ResumeSessionRequest, signal: AbortSignal): Promise<ResumeSessionResponse> {
       assertOpen()
       validateWorkspaceParams(params)
@@ -251,7 +431,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
         if (persisted === undefined || persisted.origin === 'subagent') {
           throw invalidParams(`session is not resumable: ${sessionId}`)
         }
-        if (!await sameDirectory(persisted.cwd, params.cwd)) {
+        const relocate = params._meta?.dshRelocate === true
+        if (!await sameDirectory(persisted.cwd, params.cwd) && !relocate) {
           throw invalidParams(`session cwd does not match: ${params.cwd}`)
         }
         let record: AcpSession
@@ -259,6 +440,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           record = await AcpSession.resume(ctx, {
             sessionId,
             cwd: params.cwd,
+            ...(relocate ? { relocate: true } : {}),
             mcpServers: params.mcpServers ?? [],
             agentOptions: agentOptions(config),
             signal,
@@ -344,6 +526,21 @@ export function apply(ctx: Context, config: AcpConfig): void {
       }
     },
 
+    async compact(
+      params: { sessionId: string },
+      signal: AbortSignal,
+    ): Promise<{ compacted: boolean }> {
+      assertOpen()
+      const record = requireSession(brandString<SessionId>(params.sessionId))
+      const compaction = ctx.get('compaction')
+      if (compaction === undefined) throw invalidParams('compaction is not available')
+      try {
+        return { compacted: await compaction.compactNow(record.agent, signal) !== null }
+      } catch (error: unknown) {
+        throw invalidParams(`session compaction failed: ${errorChain(error)}`)
+      }
+    },
+
     async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
       assertOpen()
       const sessionId = brandString<SessionId>(params.sessionId)
@@ -382,10 +579,14 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return {}
     })
     .onRequest(methods.agent.session.new, ({ params, signal }) => implementation.newSession(params, signal))
+    .onRequest(methods.agent.session.load, ({ params, signal }) => implementation.loadSession(params, signal))
     .onRequest(methods.agent.session.list, ({ params, signal }) => implementation.listSessions(params, signal))
+    .onRequest(methods.agent.session.fork, ({ params, signal }) => implementation.forkSession(params, signal))
     .onRequest(methods.agent.session.resume, ({ params, signal }) => implementation.resumeSession(params, signal))
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
+    .onRequest('deepseek-harness/compact', parseCompactRequest, ({ params, signal }) =>
+      implementation.compact(params, signal))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
     .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
   const connection = app.connect(stream)
@@ -515,6 +716,24 @@ function validateWorkspaceParams(params: { cwd: string; additionalDirectories?: 
   ) {
     throw invalidParams('additionalDirectories is not supported')
   }
+}
+
+/** Validate the ACP extension request before allocating a session lookup. */
+function parseCompactRequest(value: unknown): { sessionId: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw invalidParams('compaction params must be an object')
+  }
+  const sessionId = (value as Record<string, unknown>).sessionId
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw invalidParams('sessionId is required')
+  }
+  return { sessionId }
+}
+
+/** Surface the common file mutation tools as edit permissions to ACP clients. */
+function editApprovalTool(toolName: string): boolean {
+  return /^(?:edit|write|apply_patch|str_replace|file_change)$/i.test(toolName)
+    || /(?:edit|write|patch)/i.test(toolName)
 }
 
 /** Compare existing directories by physical identity and missing paths lexically. */

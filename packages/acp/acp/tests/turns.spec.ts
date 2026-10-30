@@ -29,11 +29,18 @@ async function newSession(harness: BridgeHarness): Promise<string> {
 }
 
 function messageText(harness: BridgeHarness): string {
-  return harness.updates.flatMap(update => (
-    update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text'
-      ? [update.content.text]
-      : []
-  )).join('')
+  const chunks = new Map<string, string>()
+  for (const update of harness.updates) {
+    if (update.sessionUpdate !== 'agent_message_chunk') continue
+    const retracted = update._meta?.dshRetractAttemptId
+    if (typeof retracted === 'string') {
+      chunks.delete(retracted)
+      continue
+    }
+    if (update.content.type !== 'text' || update.content.text.length === 0) continue
+    chunks.set(update.messageId ?? '', (chunks.get(update.messageId ?? '') ?? '') + update.content.text)
+  }
+  return [...chunks.values()].join('')
 }
 
 async function installDelegationTool(ctx: BridgeHarness['ctx']): Promise<() => boolean> {

@@ -26,7 +26,7 @@ describe('ACP machine permission policy', () => {
     return { agent, toolName: 'bash', callId: ToolCallId('call-9'), ...overrides }
   }
 
-  it('maps the two advertised one-shot choices', async () => {
+  it('maps one-shot and remembered choices', async () => {
     harness = await makeBridgeHarness()
     harness.onPermission = () => {
       expect(harness?.sessionUpdates.at(-1)?.update).toMatchObject({
@@ -42,12 +42,25 @@ describe('ACP machine permission policy', () => {
       toolCall: { toolCallId: 'call-9' },
       options: [
         { optionId: 'allow-once', kind: 'allow_once' },
+        { optionId: 'allow-session', kind: 'allow_always' },
         { optionId: 'reject-once', kind: 'reject_once' },
       ],
     })
 
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'reject-once' } })
     await expect(harness.ctx.approval.request(request)).resolves.toBe('rejected')
+  })
+
+  it('reuses a session grant for the same tool without prompting again', async () => {
+    harness = await makeBridgeHarness()
+    harness.onPermission = () => ({
+      outcome: { outcome: 'selected', optionId: 'allow-session' },
+    })
+    const request = await ownedRequest()
+
+    await expect(harness.ctx.approval.request(request)).resolves.toBe('allowed-once')
+    await expect(harness.ctx.approval.request(request)).resolves.toBe('allowed-once')
+    expect(harness.permissionRequests).toHaveLength(1)
   })
 
   it('maps cancellation and unknown choices without granting access', async () => {

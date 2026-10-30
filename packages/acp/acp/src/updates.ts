@@ -17,11 +17,17 @@ export async function assistantUpdates(
   ctx: Context,
   session: Session,
   event: SessionEvent<'assistant/message'>,
+  options?: {
+    /** Text already sent by block index for the live committed attempt. */
+    readonly streamedText?: ReadonlyMap<number, string>
+    /** Reasoning already sent by block index for the live committed attempt. */
+    readonly streamedReasoning?: ReadonlyMap<number, string>
+  },
 ): Promise<SessionUpdate[]> {
   const updates: SessionUpdate[] = []
-  for (const block of event.data.message.content) {
+  for (const [index, block] of event.data.message.content.entries()) {
     if (block.type === 'reasoning') {
-      if (block.text.length > 0) {
+      if (block.text.length > 0 && block.text !== options?.streamedReasoning?.get(index)) {
         updates.push({
           sessionUpdate: 'agent_thought_chunk',
           messageId: event.data.message.id,
@@ -30,6 +36,7 @@ export async function assistantUpdates(
       }
       continue
     }
+    if (block.type === 'text' && block.text === options?.streamedText?.get(index)) continue
     const content = await assistantBlockToAcp(ctx, block)
     if (content !== undefined) {
       updates.push({
@@ -41,6 +48,31 @@ export async function assistantUpdates(
   }
   const usage = usageUpdate(ctx, session, event)
   if (usage !== undefined) updates.push(usage)
+  return updates
+}
+
+/**
+ * Replay one committed user message as ordered standard ACP content chunks.
+ * @param ctx - bridge context carrying the attachment store.
+ * @param event - committed user-message event.
+ * @param meta - replay identity attached to every update.
+ * @returns ordered text and image chunks.
+ */
+export async function userUpdates(
+  ctx: Context,
+  event: SessionEvent<'user/message'>,
+  meta: Record<string, unknown>,
+): Promise<SessionUpdate[]> {
+  const updates: SessionUpdate[] = []
+  for (const block of event.data.content) {
+    const content = await assistantBlockToAcp(ctx, block)
+    if (content === undefined) continue
+    updates.push({
+      sessionUpdate: 'user_message_chunk',
+      content,
+      _meta: meta,
+    })
+  }
   return updates
 }
 

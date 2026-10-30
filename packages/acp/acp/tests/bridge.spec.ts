@@ -39,21 +39,23 @@ describe('automation-only ACP bridge', () => {
     harness = undefined
   })
 
-  it('advertises the standard automation controls without private metadata', async () => {
+  it('advertises the standard automation controls and catalog metadata', async () => {
     harness = await makeBridgeHarness()
     const response = await harness.client.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: { _meta: { terminal_output: true } },
     })
 
-    expect(response).toEqual({
+    expect(response).toMatchObject({
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
       agentCapabilities: {
+        loadSession: true,
         mcpCapabilities: { http: true },
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
-        sessionCapabilities: { close: {}, list: {}, resume: {} },
+        sessionCapabilities: { close: {}, fork: {}, list: {}, resume: {} },
       },
+      _meta: { configOptions: expect.any(Array) },
       authMethods: [],
     })
   })
@@ -76,7 +78,7 @@ describe('automation-only ACP bridge', () => {
     await expect(harness.client.authenticate({ methodId: 'unused' })).resolves.toEqual({})
   })
 
-  it('creates a session, emits one committed answer, and settles the prompt', async () => {
+  it('creates a session, streams the answer incrementally, and settles the prompt', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('hello there')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
@@ -89,10 +91,15 @@ describe('automation-only ACP bridge', () => {
     await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
     expect(harness.updates[0]).toMatchObject({
       sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: 'hello there' },
+      content: { type: 'text', text: 'h' },
     })
     expect('messageId' in harness.updates[0]!).toBe(true)
     if ('messageId' in harness.updates[0]!) expect(typeof harness.updates[0].messageId).toBe('string')
+    const streamed = harness.updates.flatMap(update =>
+      update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text'
+        ? [update.content.text]
+        : [])
+    expect(streamed.join('')).toBe('hello there')
     expect(harness.ctx.agents.get(SessionId(sessionId))?.session.header.cwd).toBe(process.cwd())
     expect(harness.adapter.requests[0]?.messages.at(-1)?.content).toEqual([{ type: 'text', text: 'say hello' }])
   })

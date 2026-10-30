@@ -10,15 +10,30 @@ import {
   type SessionNotification,
   type StopReason,
 } from '@agentclientprotocol/sdk'
-import type { Agent, AgentHandle, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
+import type {
+  Agent,
+  AgentHandle,
+  AgentOptions,
+  AgentStatus,
+  AssistantStreamFrame,
+} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-working-directory'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import {
+  appendPluginRecord,
+  pluginRecordOf,
+  type Session,
+  type SessionEvent,
+  type SessionId,
+  type SessionSeq,
+  type TurnEndReason,
+} from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import { assistantUpdates, toolCallUpdate, toolResultUpdate, userUpdates } from './updates.ts'
 
 /** Subagent completion and teardown without depending on the subagent package. */
 interface SubagentLifecycle {
@@ -31,6 +46,8 @@ interface SubagentLifecycle {
 /** Inputs shared by fresh and resumed ACP session construction. */
 interface AcpSessionBuildOptions {
   cwd: string
+  /** Adopt the ACP cwd for an existing session whose immutable header names another host/path. */
+  relocate?: boolean
   mcpServers: readonly McpServer[]
   agentOptions: AgentOptions
   signal: AbortSignal
@@ -45,6 +62,34 @@ export interface CreateAcpSessionOptions extends AcpSessionBuildOptions {
 /** Persisted ACP session construction inputs. */
 export interface ResumeAcpSessionOptions extends AcpSessionBuildOptions {
   sessionId: SessionId
+}
+
+/** Exact parent prefix used to create one independent native fork. */
+export interface ForkAcpSessionOptions extends AcpSessionBuildOptions {
+  sessionId: SessionId
+  seed: readonly SessionEvent[]
+  inheritedEventCount: number
+  parentSessionId: SessionId
+}
+
+interface StreamedAttempt {
+  readonly turn: number
+  readonly step: number
+  readonly text: Map<number, string>
+  readonly reasoning: Map<number, string>
+  chunks: number
+}
+
+interface ApprovalGrant {
+  readonly toolName: string
+}
+
+const APPROVAL_GRANT_RECORD = 'plugin:acp/approval-grant'
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface PluginRecordMap {
+    'plugin:acp/approval-grant': ApprovalGrant
+  }
 }
 
 interface InflightPrompt {
@@ -108,6 +153,8 @@ export class AcpSession {
   }
 
   private readonly disposeAgent: () => Promise<void>
+  private readonly streamedAttempts = new Map<string, StreamedAttempt>()
+  private readonly approvalGrants = new Set<string>()
 
   /**
    * Compose a fresh Agent and all requested MCP clients before publication.
@@ -123,7 +170,39 @@ export class AcpSession {
       signal: options.signal,
       setup: agentCtx => composeAgent(agentCtx, options),
     })
-    return new AcpSession(ctx, handle, options.notify)
+    const session = new AcpSession(ctx, handle, options.notify)
+    session.hydrateApprovalGrants()
+    return session
+  }
+
+  /**
+   * Compose a fresh Agent over an exact parent prefix.
+   * @param ctx - ACP plugin context.
+   * @param options - child identity, inherited events, workspace, and MCP servers.
+   * @returns the independent child session.
+   */
+  static async fork(ctx: Context, options: ForkAcpSessionOptions): Promise<AcpSession> {
+    const handle = await ctx.agents.create({
+      sessionId: options.sessionId,
+      seed: options.seed,
+      inheritedEventCount: options.inheritedEventCount,
+      meta: {
+        cwd: options.cwd,
+        parentSession: options.parentSessionId,
+        isSeeded: true,
+      },
+      agentOptions: options.agentOptions,
+      signal: options.signal,
+      setup: agentCtx => composeAgent(agentCtx, options),
+    })
+    const session = new AcpSession(ctx, handle, options.notify)
+    session.hydrateApprovalGrants()
+    if (options.relocate === true && !await samePath(session.agent.session.header.cwd, options.cwd)) {
+      const workingDirectory = ctx.get('workingDirectory')
+      if (workingDirectory === undefined) throw new Error('ACP relocation needs the workingDirectory service')
+      await workingDirectory.set(session.agent, options.cwd, options.signal)
+    }
+    return session
   }
 
   /**
@@ -141,7 +220,14 @@ export class AcpSession {
       signal: options.signal,
       setup: agentCtx => composeAgent(agentCtx, options),
     })
-    return new AcpSession(ctx, handle, options.notify)
+    const session = new AcpSession(ctx, handle, options.notify)
+    session.hydrateApprovalGrants()
+    if (options.relocate === true && !await samePath(session.agent.session.header.cwd, options.cwd)) {
+      const workingDirectory = ctx.get('workingDirectory')
+      if (workingDirectory === undefined) throw new Error('ACP relocation needs the workingDirectory service')
+      await workingDirectory.set(session.agent, options.cwd, options.signal)
+    }
+    return session
   }
 
   /**
@@ -170,6 +256,126 @@ export class AcpSession {
   configOptions(signal?: AbortSignal): Promise<SessionConfigOption[]> {
     this.assertActive()
     return this.modelControl.options(signal)
+  }
+
+  /**
+   * Whether this exact session already holds a remembered tool grant.
+   * @param toolName - approval request's tool identity.
+   */
+  hasApprovalGrant(toolName: string): boolean {
+    return this.approvalGrants.has(toolName)
+  }
+
+  /** Persist one session-scoped approval grant and apply it immediately. */
+  rememberApprovalGrant(toolName: string): void {
+    if (this.approvalGrants.has(toolName)) return
+    this.approvalGrants.add(toolName)
+    try {
+      appendPluginRecord(this.agent.session, APPROVAL_GRANT_RECORD, { toolName })
+    } catch (error: unknown) {
+      this.approvalGrants.delete(toolName)
+      throw error
+    }
+  }
+
+  /**
+   * Consume one live model-attempt publication. Text and reasoning are sent
+   * incrementally; committed tool facts remain the only tool lifecycle source.
+   * @param frame - ordered attempt frame owned by this session's Agent.
+   */
+  onAssistantStream(frame: AssistantStreamFrame): void {
+    if (this.closing !== undefined) return
+    if (frame.type === 'start') {
+      this.streamedAttempts.set(frame.attemptId, {
+        turn: frame.turn,
+        step: frame.step,
+        text: new Map(),
+        reasoning: new Map(),
+        chunks: 0,
+      })
+      return
+    }
+    const attempt = this.streamedAttempts.get(frame.attemptId)
+    if (attempt === undefined) return
+    if (frame.type === 'end') {
+      // A committed assistant/message is consumed by its queued projection,
+      // which removes the attempt after delivery. Everything else can never
+      // contribute to a later visible message.
+      if (frame.outcome.kind === 'abandoned' || frame.outcome.eventType !== 'assistant/message') {
+        const committedMessage =
+          frame.outcome.kind === 'committed' && frame.outcome.eventType === 'assistant/message'
+        if (
+          !committedMessage
+          && attempt.chunks > 0
+          && this.inflight?.admissionController.signal.aborted !== true
+        ) {
+          this.enqueueUpdate({
+            sessionUpdate: 'agent_message_chunk',
+            messageId: frame.attemptId,
+            content: { type: 'text', text: '' },
+            _meta: { dshRetractAttemptId: frame.attemptId },
+          })
+        }
+        this.streamedAttempts.delete(frame.attemptId)
+      }
+      return
+    }
+    if (frame.chunk.type !== 'text-delta' && frame.chunk.type !== 'reasoning-delta') return
+    const kind = frame.chunk.type === 'text-delta' ? 'text' : 'reasoning'
+    const chunks = kind === 'text' ? attempt.text : attempt.reasoning
+    const index = frame.chunk.index
+    chunks.set(index, (chunks.get(index) ?? '') + frame.chunk.text)
+    attempt.chunks += 1
+    const update: SessionUpdate = {
+      sessionUpdate: kind === 'text' ? 'agent_message_chunk' : 'agent_thought_chunk',
+      messageId: frame.attemptId,
+      content: { type: 'text', text: frame.chunk.text },
+      _meta: {
+        dshAttemptId: frame.attemptId,
+        dshRevision: frame.revision,
+        dshChunkIndex: frame.index,
+        dshBlockIndex: frame.chunk.index,
+        dshStreamKind: kind,
+      },
+    }
+    this.enqueueUpdate(update)
+  }
+
+  /**
+   * Replay the committed transcript in durable sequence order. Every
+   * notification carries a deterministic replay identity so clients can
+   * deduplicate it against their already persisted visible history.
+   */
+  async replay(): Promise<void> {
+    this.assertActive()
+    for (const event of this.agent.session.snapshotEvents()) {
+      const meta = {
+        isReplay: true,
+        dshSeq: event.seq,
+        dshEventType: event.type,
+      }
+      const updates: SessionUpdate[] = []
+      if (event.type === 'user/message') {
+        updates.push(...await userUpdates(this.ctx, event, { ...meta, dshMessageId: event.data.id }))
+      } else if (event.type === 'assistant/message') {
+        updates.push(...(await assistantUpdates(this.ctx, this.agent.session, event)).map(update => ({
+          ...update,
+          _meta: { ...meta, dshMessageId: event.data.message.id },
+        })))
+      } else if (event.type === 'tool/call') {
+        updates.push({ ...toolCallUpdate(event), _meta: meta })
+      } else if (event.type === 'tool/result') {
+        updates.push({ ...await toolResultUpdate(this.ctx, event), _meta: meta })
+      }
+      for (const update of updates) {
+        await this.notify({
+          sessionId: this.agent.session.id,
+          update,
+          _meta: meta,
+        })
+      }
+    }
+    await this.outputTail
   }
 
   /**
@@ -325,17 +531,22 @@ export class AcpSession {
     try {
       if (event.type === 'assistant/message') {
         const inflight = this.inflight?.turn === event.data.turn ? this.inflight : undefined
+        const streamed = this.streamedPayload(event.data.turn, event.data.step)
         const previous = this.outputTail
         const delivery = previous.then(async () => {
-          for (const update of await assistantUpdates(this.ctx, session, event)) {
+          for (const update of await assistantUpdates(this.ctx, session, event, streamed)) {
             await this.notify({ sessionId: this.agent.session.id, update })
           }
         })
-        this.outputTail = delivery.catch((error: unknown) => {
-          const failure = error as Error
-          if (inflight !== undefined) inflight.outputError ??= failure
-          this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
-        })
+        this.outputTail = delivery
+          .catch((error: unknown) => {
+            const failure = error as Error
+            if (inflight !== undefined) inflight.outputError ??= failure
+            this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
+          })
+          .finally(() => {
+            this.clearStreamedPayload(event.data.turn, event.data.step)
+          })
       } else if (event.type === 'tool/call') {
         const previous = this.outputTail
         this.outputTail = previous
@@ -452,6 +663,63 @@ export class AcpSession {
     return this.closing
   }
 
+  /** Queue one live notification behind all previously emitted protocol output. */
+  private enqueueUpdate(update: SessionUpdate): void {
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({ sessionId: this.agent.session.id, update }))
+      /* v8 ignore start -- the bridge notifier contains transport failures. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: assistant stream delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
+  }
+
+  /** Read the exact text and reasoning already emitted for one turn step. */
+  private streamedPayload(
+    turn: number,
+    step: number,
+  ): {
+    readonly streamedText?: ReadonlyMap<number, string>
+    readonly streamedReasoning?: ReadonlyMap<number, string>
+  } {
+    const matching = [...this.streamedAttempts.values()].filter(
+      attempt => attempt.turn === turn && attempt.step === step && attempt.chunks > 0,
+    )
+    if (matching.length === 0) return {}
+    // Retried attempts settle and leave this map before the next attempt
+    // starts. The last remaining attempt is the one that committed the
+    // visible assistant message, including multi-block responses.
+    const attempt = matching.at(-1)!
+    return {
+      ...attempt.text.size > 0 ? { streamedText: attempt.text } : {},
+      ...attempt.reasoning.size > 0 ? { streamedReasoning: attempt.reasoning } : {},
+    }
+  }
+
+  /** Release transient attempt text after its durable message has settled. */
+  private clearStreamedPayload(turn: number, step: number): void {
+    for (const [id, attempt] of this.streamedAttempts) {
+      if (attempt.turn === turn && attempt.step === step) this.streamedAttempts.delete(id)
+    }
+  }
+
+  /** Restore session-scoped remembered grants from the durable log. */
+  private hydrateApprovalGrants(): void {
+    for (const event of this.agent.session.snapshotEvents()) {
+      const record = pluginRecordOf(event)
+      if (record?.type !== APPROVAL_GRANT_RECORD) continue
+      const data: unknown = record.data
+      if (
+        typeof data === 'object'
+        && data !== null
+        && 'toolName' in data
+        && typeof data.toolName === 'string'
+        && data.toolName.length > 0
+      ) this.approvalGrants.add(data.toolName)
+    }
+  }
+
   private assertActive(): void {
     if (this.closing !== undefined) throw invalidParams(`session is closing: ${this.agent.session.id}`)
   }
@@ -528,5 +796,18 @@ export class AcpSession {
         inflight.reject(internalError(`prompt settlement failed: ${errorChain(error)}`))
       })
     /* v8 ignore stop */
+  }
+}
+
+/** Compare paths after the fs service has already validated the destination. */
+async function samePath(left: string | undefined, right: string): Promise<boolean> {
+  if (left === undefined) return false
+  const { realpath } = await import('node:fs/promises')
+  const { resolve } = await import('node:path')
+  try {
+    const [a, b] = await Promise.all([realpath(left), realpath(right)])
+    return a === b
+  } catch (_unresolvablePath) {
+    return resolve(left) === resolve(right)
   }
 }
