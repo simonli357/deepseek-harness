@@ -55,7 +55,6 @@ describe('automation-only ACP bridge', () => {
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
         sessionCapabilities: { close: {}, fork: {}, list: {}, resume: {} },
       },
-      _meta: { configOptions: expect.any(Array) },
       authMethods: [],
     })
   })
