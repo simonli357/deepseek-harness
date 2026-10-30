@@ -1,4 +1,4 @@
-import { isAbsolute } from 'node:path'
+import { posix, win32 } from 'node:path'
 import {
   SessionFormatError,
   SessionFormatUnsupportedMigrationError,
@@ -13,6 +13,11 @@ import type {
 } from '@deepseek-ai/dsh-session-format'
 import { assertReleasedArtifactRelationships } from '@deepseek-ai/dsh-session-format-v0-to-v1'
 import { RELEASED_V2_EVENT_DISPOSITIONS } from './dispositions.ts'
+
+/** Persisted sessions can move between linked Windows and POSIX hosts. */
+function isPortableAbsolute(path: string): boolean {
+  return posix.isAbsolute(path) || win32.isAbsolute(path)
+}
 
 const HEADER_REQUIRED = ['version', 'id', 'createdAt', 'isSeeded', 'delegationDepth'] as const
 const HEADER_OPTIONAL = ['cwd', 'parentSession', 'origin', 'agentPreset'] as const
@@ -38,7 +43,7 @@ export function assertReleasedV2Header(header: SessionFormatHeader): void {
   sessionFormatCount(record['createdAt'], 'format v2 header createdAt')
   sessionFormatCount(record['delegationDepth'], 'format v2 header delegationDepth')
   if (typeof record['isSeeded'] !== 'boolean') throw new SessionFormatError('format v2 header isSeeded must be boolean')
-  if (record['cwd'] !== undefined && (typeof record['cwd'] !== 'string' || !isAbsolute(record['cwd']))) {
+  if (record['cwd'] !== undefined && (typeof record['cwd'] !== 'string' || !isPortableAbsolute(record['cwd']))) {
     throw new SessionFormatError('format v2 header cwd must be absolute')
   }
   for (const key of ['parentSession', 'agentPreset'] as const) {

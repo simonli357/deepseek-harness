@@ -117,6 +117,7 @@ describe('released v2 header validation', () => {
 
   it('accepts minimal and complete logical headers', () => {
     expect(() => { assertReleasedV2Header(minimal) }).not.toThrow()
+    expect(() => { assertReleasedV2Header({ ...minimal, cwd: 'C:\\work' }) }).not.toThrow()
     expect(() => { assertReleasedV2Header({
       ...minimal,
       cwd: '/work',

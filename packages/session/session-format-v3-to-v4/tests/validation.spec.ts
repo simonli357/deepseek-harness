@@ -75,6 +75,7 @@ function conversation(): Record<string, unknown>[] {
 describe('assertReleasedV4Header', () => {
   it('accepts the minimal and complete header images', () => {
     expect(() => { assertReleasedV4Header(header()) }).not.toThrow()
+    expect(() => { assertReleasedV4Header(header({ cwd: 'C:\\work' })) }).not.toThrow()
     expect(() => { assertReleasedV4Header(header({
       cwd: '/work', parentSession: 'parent', origin: 'subagent', agentPreset: 'headless', isSeeded: true,
     })) }).not.toThrow()

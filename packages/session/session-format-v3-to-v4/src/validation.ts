@@ -1,6 +1,6 @@
 /** Native V4 metadata and generation-owned relationship validation. */
 
-import { isAbsolute } from 'node:path'
+import { posix, win32 } from 'node:path'
 import { SessionFormatError, SessionFormatUnsupportedMigrationError, isSessionFormatJsonObject, sessionFormatCount } from '@deepseek-ai/dsh-session-format'
 import type { SessionFormatArtifact, SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
 import { assertV4DeveloperData } from './developer.ts'
@@ -11,6 +11,11 @@ import { assertV4RetiredSyntax } from './retired-syntax.ts'
 import { assertV4SystemMessageFields } from './system-message.ts'
 import { assertV4ForkResult } from './fork-result.ts'
 import { assertV4ToolResultMessage } from './tool-role.ts'
+
+/** Persisted sessions can move between linked Windows and POSIX hosts. */
+function isPortableAbsolute(path: string): boolean {
+  return posix.isAbsolute(path) || win32.isAbsolute(path)
+}
 
 /**
  * Validate the exact native V4 logical header.
@@ -28,7 +33,7 @@ export function assertReleasedV4Header(header: unknown): void {
   sessionFormatCount(header.createdAt, 'format v4 header createdAt')
   sessionFormatCount(header.delegationDepth, 'format v4 header delegationDepth')
   if (typeof header.isSeeded !== 'boolean') throw new SessionFormatError('format v4 header isSeeded must be boolean')
-  if (header.cwd !== undefined && (typeof header.cwd !== 'string' || !isAbsolute(header.cwd))) {
+  if (header.cwd !== undefined && (typeof header.cwd !== 'string' || !isPortableAbsolute(header.cwd))) {
     throw new SessionFormatError('format v4 header cwd must be absolute')
   }
   for (const key of ['parentSession', 'agentPreset']) {
