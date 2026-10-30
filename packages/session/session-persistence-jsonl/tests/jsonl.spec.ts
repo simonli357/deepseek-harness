@@ -410,6 +410,22 @@ describe('JsonlSessionPersistence: format helpers', () => {
     ))).toThrow(`session "123" uses log format v${SESSION_FORMAT_VERSION + 1}`)
   })
 
+  it('accepts a session header whose cwd comes from the other linked platform', () => {
+    const id = SessionId('portable-header')
+    const scanned = scanLog(Buffer.from(
+      `${JSON.stringify({
+        type: 'session',
+        version: SESSION_FORMAT_VERSION,
+        id,
+        createdAt: 1,
+        cwd: 'D:\\workenv\\moved-repo',
+        isSeeded: false,
+        delegationDepth: 0,
+      })}\n`,
+    ))
+    expect(scanned.meta).toMatchObject({ id, cwd: 'D:\\workenv\\moved-repo' })
+  })
+
   it('encodeSegment neutralizes traversal, separators, and absolute paths', () => {
     expect(encodeSegment('..')).toBe('~002E~002E')
     expect(encodeSegment('.')).toBe('~002E')

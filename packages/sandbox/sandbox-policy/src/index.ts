@@ -196,9 +196,18 @@ export class SandboxPolicyService extends Service {
    */
   resolve(request: SandboxPolicyRequest = {}): SandboxExecutionPolicy {
     const { session } = request
+    // A relocated session keeps its original header cwd while its effective
+    // working directory names this host's equivalent workspace.
+    const workingDirectory = this.ctx.get('workingDirectory') as
+      | { get(session: Session): string }
+      | undefined
     return {
       mode: request.mode ?? (session === undefined ? undefined : this.overrideOf(session)) ?? this.defaultMode,
-      workspaceRoot: resolveWorkspaceRoot(session?.header.cwd ?? this.workspaceRoot),
+      workspaceRoot: resolveWorkspaceRoot(
+        (session === undefined ? undefined : workingDirectory?.get(session))
+          ?? session?.header.cwd
+          ?? this.workspaceRoot,
+      ),
       ...this.additionalWritableRoots === undefined ? {} : { additionalWritableRoots: this.additionalWritableRoots },
       ...session === undefined ? {} : { sessionId: session.id },
     }
