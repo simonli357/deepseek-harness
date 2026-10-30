@@ -8,6 +8,7 @@ import {
   type PromptResponse,
   type SessionConfigOption,
   type SessionNotification,
+  type SessionUpdate,
   type StopReason,
 } from '@agentclientprotocol/sdk'
 import type {
@@ -23,10 +24,10 @@ import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/ds
 import {
   appendPluginRecord,
   pluginRecordOf,
+  SessionLogOffset,
   type Session,
   type SessionEvent,
   type SessionId,
-  type SessionSeq,
   type TurnEndReason,
 } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
@@ -185,7 +186,7 @@ export class AcpSession {
     const handle = await ctx.agents.create({
       sessionId: options.sessionId,
       seed: options.seed,
-      inheritedEventCount: options.inheritedEventCount,
+      inheritedEventCount: SessionLogOffset(options.inheritedEventCount),
       meta: {
         cwd: options.cwd,
         parentSession: options.parentSessionId,

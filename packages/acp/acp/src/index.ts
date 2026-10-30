@@ -59,10 +59,9 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-compaction'
-import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import { supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
-import { AcpModelConfigError, AcpModelControl } from './model-control.ts'
+import { AcpModelConfigError } from './model-control.ts'
 import { AcpSession } from './session.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
@@ -206,20 +205,6 @@ export function apply(ctx: Context, config: AcpConfig): void {
       // Single-version agent: the spec's "same version if supported, else
       // the latest supported" both resolve to this server's one version.
       imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
-      const configured = config.provider !== undefined && config.model !== undefined
-        ? {
-            provider: config.provider,
-            model: config.model,
-          } satisfies ModelSelection
-        : ctx.get('agentDefaultModel')?.currentSelection()
-      const configOptions = configured === undefined
-        ? []
-        : await new AcpModelControl(ctx.llm, {
-            current: () => configured,
-            select: () => {},
-            lastStepBoundary: null,
-            lastTurn: 0,
-          }).options()
       return {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
@@ -229,7 +214,6 @@ export function apply(ctx: Context, config: AcpConfig): void {
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
           sessionCapabilities: { close: {}, fork: {}, list: {}, resume: {} },
         },
-        _meta: { configOptions },
         authMethods: [],
       }
     },
