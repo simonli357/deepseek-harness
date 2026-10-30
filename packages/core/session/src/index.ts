@@ -7,7 +7,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import { isAbsolute } from 'node:path'
+import { posix, win32 } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { assertNever, deepFreeze, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
@@ -23,6 +23,11 @@ import { ToolHistoryProjection } from './tool-history.ts'
 import type { ToolHistory } from '@deepseek-ai/dsh-llm'
 
 import { buildForkSeed } from './fork.ts'
+
+/** Persisted sessions can move between linked Windows and POSIX hosts. */
+function isPortableAbsolute(path: string): boolean {
+  return posix.isAbsolute(path) || win32.isAbsolute(path)
+}
 
 export { buildForkSeed } from './fork.ts'
 export * from './types.ts'
@@ -113,7 +118,7 @@ function validateSessionHeader(id: SessionId, input: unknown): SessionHeader {
   }
   if (record.cwd !== undefined) {
     if (typeof record.cwd !== 'string') throw new Error('session header cwd must be a string')
-    if (!isAbsolute(record.cwd)) {
+    if (!isPortableAbsolute(record.cwd)) {
       throw new Error(`session header cwd must be an absolute path, got "${record.cwd}"`)
     }
   }

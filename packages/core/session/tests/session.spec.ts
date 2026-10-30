@@ -1207,6 +1207,17 @@ describe('Session', () => {
     }
   })
 
+  it('accepts a moved Windows header on a POSIX host', () => {
+    const header = {
+      version: SESSION_FORMAT_VERSION,
+      id: SessionId('moved-windows-header'),
+      createdAt: 123,
+      isSeeded: false,
+      cwd: 'C:\\work',
+    }
+    expect(() => Session.create(SessionId('moved-windows-header'), undefined, header)).not.toThrow()
+  })
+
   it('retains opaque logical header metadata except the physical v0 seed field', () => {
     const id = SessionId('header-extension')
     const session = Session.create(id, undefined, {
